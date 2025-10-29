@@ -22,12 +22,10 @@ class CDTrainer():
         self.dataloaders = dataloaders
         self.n_class = args.n_class
         self.net_G = define_G(args=args, gpu_ids=args.gpu_ids)
-        self.device = torch.device(
-            f"cuda:{args.gpu_ids[0]}" if torch.cuda.is_available() and len(args.gpu_ids) > 0 else "cpu"
-        )
+        self.device = torch.device(f"cuda:{args.gpu_ids[0]}" if torch.cuda.is_available() and len(args.gpu_ids) > 0 else "cpu")
         print(self.device)
 
-        # Optimizer setup
+        # Optimizer
         self.lr = args.lr
         if args.optimizer == "sgd":
             self.optimizer_G = optim.SGD(self.net_G.parameters(), lr=self.lr, momentum=0.9, weight_decay=5e-4)
@@ -43,15 +41,14 @@ class CDTrainer():
         self.logger = Logger(logger_path)
         self.logger.write_dict_str(args.__dict__)
         self.timer = Timer()
-        self.batch_size = args.batch_size
 
         self.epoch_acc = 0
         self.best_val_acc = 0.0
         self.best_epoch_id = 0
         self.epoch_to_start = 0
         self.max_num_epochs = args.max_epochs
-
         self.global_step = 0
+        self.batch_size = args.batch_size
         self.steps_per_epoch = len(dataloaders['train'])
         self.total_steps = (self.max_num_epochs - self.epoch_to_start) * self.steps_per_epoch
 
@@ -65,7 +62,7 @@ class CDTrainer():
         self.multi_scale_infer = args.multi_scale_infer
         self.weights = tuple(args.multi_pred_weights)
 
-        # Loss selection
+        # Loss setup
         if args.loss == 'ce':
             self._pxl_loss = cross_entropy
         elif args.loss == 'bce':
@@ -87,8 +84,14 @@ class CDTrainer():
         print("\n")
         ckpt_path = os.path.join(self.checkpoint_dir, ckpt_name)
         if os.path.exists(ckpt_path):
-            self.logger.write('loading last checkpoint...\n')
-            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            self.logger.write('Loading checkpoint...\n')
+            import torch.serialization, numpy as np
+            torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+            try:
+                checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(ckpt_path, map_location=self.device)
+
             self.net_G.load_state_dict(checkpoint['model_G_state_dict'])
             self.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
             self.exp_lr_scheduler_G.load_state_dict(checkpoint['exp_lr_scheduler_G_state_dict'])
@@ -96,7 +99,7 @@ class CDTrainer():
             self.epoch_to_start = checkpoint['epoch_id'] + 1
             self.best_val_acc = checkpoint['best_val_acc']
             self.best_epoch_id = checkpoint['best_epoch_id']
-            self.logger.write('Epoch_to_start = %d, Historical_best_acc = %.4f (at epoch %d)\n' %
+            self.logger.write('Resuming from epoch %d | Best acc: %.4f at epoch %d\n' %
                               (self.epoch_to_start, self.best_val_acc, self.best_epoch_id))
         else:
             self.logger.write('Training from scratch...\n')
@@ -140,7 +143,7 @@ class CDTrainer():
         for epoch in range(self.epoch_to_start, self.max_num_epochs):
             self.epoch_id = epoch
             self.net_G.train()
-            self.logger.write(f"lr: {self.optimizer_G.param_groups[0]['lr']:.7f}\n\n")
+            self.logger.write(f"\n[Epoch {epoch}] LR: {self.optimizer_G.param_groups[0]['lr']:.7f}\n")
             for i, batch in tqdm(enumerate(self.dataloaders['train']), total=len(self.dataloaders['train'])):
                 self._forward_pass(batch)
                 self.optimizer_G.zero_grad()
@@ -152,7 +155,7 @@ class CDTrainer():
             self._save_visuals(epoch)
             self._evaluate(epoch)
 
-            print(f"[Epoch {epoch}] ✔️ Training complete. Loss: {self.G_loss.item():.6f}")
+            print(f"[Epoch {epoch}] Training done. Loss: {self.G_loss.item():.6f}")
             self.logger.write(f"Epoch {epoch}: Loss = {self.G_loss.item():.6f}\n")
 
     def _save_checkpoint(self, checkpoint_name):
@@ -167,7 +170,7 @@ class CDTrainer():
             'best_epoch_id': self.best_epoch_id
         }
         torch.save(state, ckpt_path)
-        print(f"[💾] Checkpoint saved: {ckpt_path}")
+        print(f"[Saved] Checkpoint: {ckpt_path}")
 
     def _save_visuals(self, epoch):
         self.net_G.eval()
@@ -197,7 +200,7 @@ class CDTrainer():
                 pd_img = (np.stack([preds[i]]*3, axis=-1) * 255).astype(np.uint8)
                 concat = np.concatenate([a_img, b_img, gt_img, pd_img], axis=1)
                 Image.fromarray(concat).save(os.path.join(vis_path, f"sample_{i:02d}.png"))
-        print(f"[🖼️] Visuals saved: {vis_path}")
+        print(f"[Saved] Visuals: {vis_path}")
 
     def _evaluate(self, epoch):
         self.net_G.eval()
@@ -214,7 +217,10 @@ class CDTrainer():
                 label = label.squeeze(1)
                 self.running_metric.update_cm(pr=pred, gt=label)
 
+        # ⏱️ Print and log metrics
         scores = self.running_metric.get_scores()
+        print(f"\n[Validation Metrics] Epoch {epoch:03d}:")
+        for k, v in sorted(scores.items()):
+            print(f"    {k:<12s}: {v:.4f}")
         log_str = "\n".join([f"{k}: {v:.5f}" for k, v in scores.items()])
-        print(f"\n[📊] Validation Metrics (Epoch {epoch}):\n{log_str}")
-        self.logger.write(f"\n[📊] Validation Metrics (Epoch {epoch}):\n{log_str}\n")
+        self.logger.write(f"\n[Validation Metrics] Epoch {epoch}:\n{log_str}\n")
